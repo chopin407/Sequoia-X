@@ -1,7 +1,7 @@
 """Sequoia-X V2 主程序入口。
 
 两种运行模式：
-  python main.py               # 日常模式：4进程增量补数据 + 跑策略 + 飞书推送
+  python main.py               # 日常模式：同步行情 + 跑策略 + 本地报告
   python main.py --backfill    # 回填模式：单线程保守拉全市场历史K线（较慢，取决于限速）
 """
 
@@ -17,10 +17,10 @@ from dotenv import load_dotenv
 
 from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.engine import DataEngine
-from sequoia_x.notify.feishu import FeishuNotifier
+from sequoia_x.data.factory import create_engine
 from sequoia_x.notify.report import ReportGenerator
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.timeframes import analyze_timeframes, timeframe_markdown
 from sequoia_x.strategy.bowl_rebound import BowlReboundStrategy
 from sequoia_x.strategy.FirstNewHigh30DaysBreakoutStrategy import FirstNewHigh30DaysBreakoutStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -98,18 +98,15 @@ def _build_resonance_hits(
 
 def _run_strategy_worker(
     strategy_cls: type[BaseStrategy],
-    db_path: str,
-    start_date: str,
+    settings: Settings,
+    skip_sync: bool = False,
 ) -> tuple[str, list[str], str | None]:
     """ProcessPool worker: instantiate engine+strategy and run, returning (name, selected, error_or_none)."""
-    from sequoia_x.core.config import get_settings as _gs
-
-    settings = _gs()
-    engine = DataEngine(settings)
+    engine = create_engine(settings, local_only=True) if skip_sync else create_engine(settings)
     instance = strategy_cls(engine=engine, settings=settings)
     name = type(instance).__name__
     try:
-        selected = instance.run()
+        selected = engine.filter_symbols(instance.run())
         return (name, selected, None)
     except Exception as exc:
         return (name, [], str(exc))
@@ -118,10 +115,16 @@ def _run_strategy_worker(
 def main() -> None:
     load_dotenv()
     socket.setdefaulttimeout(10.0)
-    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
-    parser.add_argument(
+    data_mode = parser.add_mutually_exclusive_group()
+    data_mode.add_argument(
+        "--skip-sync", action="store_true",
+        help="跳过数据拉取，仅使用本地行情和股票池运行策略、生成报告",
+    )
+    data_mode.add_argument(
         "--backfill",
         action="store_true",
         help="回填模式：单线程保守拉取全市场历史 K 线（较慢，取决于限速）",
@@ -148,7 +151,8 @@ def main() -> None:
         logger.info("Sequoia-X V2 启动")
 
         # 3. 初始化数据引擎
-        engine = DataEngine(settings)
+        engine = (create_engine(settings, local_only=True)
+                  if args.skip_sync else create_engine(settings))
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
@@ -158,10 +162,14 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
-        logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        if args.skip_sync:
+            if not engine.load_all_ohlcv():
+                raise RuntimeError("本地没有可用行情，请先运行数据同步或 --backfill")
+            logger.info("跳过数据拉取，基于本地快照运行；股票状态以缓存为准")
+        else:
+            logger.info("开始拉取最新快照...")
+            count = engine.sync_today_bulk()
+            logger.info(f"快照同步完成，写入 {count} 只股票")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategy_classes: list[type[BaseStrategy]] = [
@@ -180,7 +188,12 @@ def main() -> None:
             StopFallStrategy,
         ]
 
+        if args.skip_sync:
+            strategy_classes.remove(PrivatePlacementStrategy)
+            logger.info("本地模式跳过定增公告策略；海龟策略不查询实时流通市值")
+
         strategy_results: dict[str, list[str]] = {}
+        strategy_errors: dict[str, str] = {}
 
         if args.parallel:
             # ── 并行模式 ──
@@ -193,8 +206,8 @@ def main() -> None:
                     executor.submit(
                         _run_strategy_worker,
                         cls,
-                        settings.db_path,
-                        settings.start_date,
+                        settings,
+                        args.skip_sync,
                     ): cls.__name__
                     for cls in strategy_classes
                 }
@@ -204,9 +217,11 @@ def main() -> None:
                         name, selected, error = future.result()
                     except Exception as exc:
                         logger.warning(f"[{cls_name}] 进程异常：{exc}")
+                        strategy_errors[cls_name] = "策略进程异常"
                         continue
                     if error:
                         logger.warning(f"[{name}] 执行失败：{error}")
+                        strategy_errors[name] = error
                     else:
                         strategy_results[name] = selected
                         logger.info(f"{name} 选出 {len(selected)} 只股票")
@@ -222,8 +237,9 @@ def main() -> None:
                 t0 = time.perf_counter()
                 logger.info(f"执行策略：{strategy_name}")
                 try:
-                    selected: list[str] = strategy.run()
-                except Exception:
+                    selected: list[str] = engine.filter_symbols(strategy.run())
+                except Exception as exc:
+                    strategy_errors[strategy_name] = str(exc)
                     logger.exception(f"{strategy_name} 执行失败，跳过该策略")
                     continue
                 elapsed = time.perf_counter() - t0
@@ -232,48 +248,40 @@ def main() -> None:
             strategy_total = time.perf_counter() - strategy_start
             logger.info(f"── 策略全部完成（串行），总耗时 {strategy_total:.1f}s ──")
 
-        # 5. 推送各策略结果到飞书
-        notifier = FeishuNotifier(settings)
-        # 构建策略名→webhook_key 的映射（类属性）
-        webhook_map: dict[str, str] = {
-            cls.__name__: getattr(cls, "webhook_key", "default")
-            for cls in strategy_classes
-        }
-        for name, symbols in strategy_results.items():
-            webhook_key = webhook_map.get(name, "default")
-            if symbols:
-                try:
-                    notifier.send(
-                        symbols=symbols,
-                        strategy_name=name,
-                        webhook_key=webhook_key,
-                    )
-                except Exception:
-                    logger.exception(f"{name} 飞书推送失败，继续")
-            else:
-                logger.info(f"{name} 无选股结果，跳过推送")
+        timeframe_section = ""
+        if settings.weekly_filter_enabled:
+            raw_results = strategy_results
+            strategy_results, states, exits = analyze_timeframes(
+                engine, raw_results, settings.holding_symbols
+            )
+            timeframe_section = timeframe_markdown(raw_results, states, exits)
 
-        # 6. 所有策略完成后，推送高/中吸引力策略共振股票
+        if args.skip_sync:
+            timeframe_section = (
+                "> 本地快照模式：未拉取新数据，股票状态以缓存为准；"
+                "跳过定增公告与实时流通市值排序。\n\n" + timeframe_section
+            )
+
+        if strategy_errors:
+            timeframe_section += "\n\n## 未完成的策略\n\n"
+            timeframe_section += "\n".join(
+                f"- {name}：执行失败，结果不可用（详见运行日志）"
+                for name in strategy_errors
+            )
+
+        # 本地报告保留策略共振汇总。
         resonance_hits = _build_resonance_hits(strategy_results)
-        if resonance_hits["high"] or resonance_hits["medium"]:
-            try:
-                notifier.send_resonance(
-                    hits=resonance_hits,
-                    strategy_name="StrategyResonance",
-                    webhook_key="strategy_resonance",
-                )
-            except Exception:
-                logger.exception("StrategyResonance 飞书推送失败")
-        else:
-            logger.info("StrategyResonance 无共振股票，跳过推送")
 
         # 7. 生成 Markdown 选股报告
         try:
-            report_gen = ReportGenerator(settings)
-            report_path = report_gen.generate(strategy_results, resonance_hits)
+            report_gen = ReportGenerator(settings, engine=engine)
+            report_path = report_gen.generate(
+                strategy_results, resonance_hits, extra_section=timeframe_section
+            )
             logger.info(f"选股报告已生成：{report_path}")
         except Exception:
             logger.exception("Markdown 报告生成失败")
+            raise
 
     except Exception:
         try:

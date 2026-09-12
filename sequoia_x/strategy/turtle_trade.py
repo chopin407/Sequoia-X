@@ -30,6 +30,11 @@ class TurtleTradeStrategy(BaseStrategy):
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
+        if getattr(self.engine, "local_only", False):
+            return {}
+        if hasattr(self.engine, "get_market_caps"):
+            return self.engine.get_market_caps(symbols)
+
         from datetime import date
 
         import baostock as bs

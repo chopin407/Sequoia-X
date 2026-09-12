@@ -1,5 +1,6 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
+from contextlib import closing
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pandas as pd
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.data.universe import eligible
 
 logger = get_logger(__name__)
 
@@ -149,6 +151,8 @@ class DataEngine:
     """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
 
     def __init__(self, settings: Settings) -> None:
+        self._stock_names = {}
+        self._universe = None
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
         self.baostock_max_workers = max(
@@ -172,7 +176,7 @@ class DataEngine:
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -183,7 +187,7 @@ class DataEngine:
         logger.info(f"数据库初始化完成：{self.db_path}")
 
     def _get_last_date(self, symbol: str) -> str | None:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             row = conn.execute(
                 "SELECT MAX(date) FROM stock_daily WHERE symbol = ?",
                 (symbol,),
@@ -202,7 +206,7 @@ class DataEngine:
 
     def _load_from_db(self) -> dict[str, pd.DataFrame]:
         """从 SQLite 一次性读取全表并按 symbol 分组。"""
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             df = pd.read_sql(
                 "SELECT symbol,date,open,high,low,close,volume,turnover "
                 "FROM stock_daily ORDER BY symbol, date",
@@ -212,6 +216,8 @@ class DataEngine:
             return {}
         result: dict[str, pd.DataFrame] = {}
         for sym, grp in df.groupby("symbol", sort=False):
+            if self._universe is not None and str(sym) not in self._universe:
+                continue
             result[str(sym)] = grp.reset_index(drop=True)
         return result
 
@@ -236,7 +242,7 @@ class DataEngine:
         self._ensure_cache()
         if self._ohlcv_cache is not None and symbol in self._ohlcv_cache:
             return self._ohlcv_cache[symbol].copy()
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             df = pd.read_sql(
                 "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
                 conn,
@@ -267,7 +273,7 @@ class DataEngine:
         today_str = date.today().strftime("%Y-%m-%d")
 
         tasks = []
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
@@ -277,6 +283,8 @@ class DataEngine:
             return 0
 
         for symbol, last_date in rows:
+            if self._universe is not None and symbol not in self._universe:
+                continue
             if last_date and last_date >= today_str:
                 continue
             start = today_str
@@ -336,7 +344,7 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             # 安全 DELETE：只删除即将写入的具体 (symbol, date) 行，
             # 不影响同日期其他股票的数据，避免中途崩溃造成数据丢失
             pairs = df[["symbol", "date"]].drop_duplicates().values.tolist()
@@ -487,7 +495,7 @@ class DataEngine:
                 df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
 
                 try:
-                    with sqlite3.connect(self.db_path) as conn:
+                    with closing(sqlite3.connect(self.db_path)) as conn, conn:
                         df.to_sql(
                             "stock_daily", conn, if_exists="append",
                             index=False, method="multi", chunksize=500,
@@ -532,8 +540,12 @@ class DataEngine:
                 code = row[0]           # "sh.600000" or "sz.000001"
                 status = row[4]         # "1" = 上市
                 stock_type = row[5]     # "1" = 股票
-                if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
+                exchange, symbol = code.split(".")
+                if status == "1" and stock_type == "1" and eligible(symbol, row[1], exchange):
+                    symbols.append(symbol)
+                    self._stock_names[symbol] = row[1]
+            self._universe = set(symbols)
+            self.invalidate_cache()
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
             return symbols
         except Exception as e:
@@ -546,8 +558,25 @@ class DataEngine:
                 pass
 
     def get_local_symbols(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             rows = conn.execute(
                 "SELECT DISTINCT symbol FROM stock_daily"
             ).fetchall()
         return [row[0] for row in rows]
+
+    def strategy_frame(self) -> pd.DataFrame:
+        """统一提供策略输入，避免横截面策略绕过股票池过滤。"""
+        frames = list(self.load_all_ohlcv().values())
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def filter_symbols(self, symbols: list[str]) -> list[str]:
+        allowed = set(self.load_all_ohlcv())
+        return list(dict.fromkeys(s for s in symbols if s in allowed))
+
+    def get_stock_name(self, symbol: str) -> str:
+        return self._stock_names.get(symbol, "")
+
+    def report_status(self) -> str:
+        data = self.load_all_ohlcv()
+        latest = max((str(df.iloc[-1]["date"]) for df in data.values()), default="无")
+        return f"- 数据源：baostock（后复权）；行情日期：{latest}；实际扫描：{len(data)}。"

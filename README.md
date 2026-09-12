@@ -6,33 +6,19 @@
 
 ---
 
-## 简介 | Introduction
+## 本地 TDX 工作流
 
-Sequoia-X V3 是面向 A 股市场的量化选股系统，基于现代 Python 工程化标准从零重构。
-系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股，
-通过飞书交互式卡片推送至群，并在本地生成 Markdown 选股报告。
-
-数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
-存储于本地 SQLite，彻底规避东方财富反爬问题。
-
----
-
-## 运行方式 | Run Modes
+默认连接局域网 `http://192.168.1.74:8080`，只扫描沪深主板、科创板和创业板 A 股。
+在策略计算及横截面排名前，统一排除 ST、退市名称、北交所、B股、基金和指数。
+日常运行只生成本地 Markdown 报告，不发送飞书通知，也不要求配置 Webhook。
 
 ```bash
-python main.py                 # 日常模式（默认串行）：增量补数据 + 13 个策略 + 飞书推送 + 本地报告
-python main.py --parallel      # 日常并行模式：多进程并行执行策略（可选 --max-workers N 指定进程数）
-python main.py --backfill      # 回填模式：单线程保守灌入历史 K 线（较慢，取决于限速）
+python main.py                              # 同步行情、运行策略、生成本地报告
+python main.py --backfill                   # 仅补齐历史数据
+python main.py --parallel --max-workers 2   # 并行执行策略
 ```
 
-macOS 可双击启动（自动检测 `.venv/bin/python`，缺失则回退系统 `python3`）：
-
-- `launch_sequoia_x.command` —— 日常模式
-- `launch_sequoia_x_backfill.command` —— 回填模式
-
-另有 `scripts/bench.py`：只跑策略并统计各自耗时，跳过数据同步、推送与报告，用于基线压测。
-
----
+TDX 首次运行会自动获取股票池并回填历史，新上市股票也会自动补入。建议收盘后运行。
 
 ## 内置策略 | Strategies
 
@@ -125,78 +111,25 @@ macOS 可双击启动（自动检测 `.venv/bin/python`，缺失则回退系统 
 
 ---
 
-## 特色功能 | Features
+## 配置与运行
 
-- **飞书交互式卡片**：每个策略生成「📈 选股播报」卡片，含日期、选股数量与雪球链接；股票名称自动补全（沪深走 baostock、北交所走腾讯行情兜底）。
-- **策略专属机器人**：通过 `STRATEGY_WEBHOOK_<策略标识>=URL` 为每个策略单独路由飞书机器人，未配置的策略自动使用默认 `FEISHU_WEBHOOK_URL`。
-- **策略共振推送**：多策略命中同一股票时按 高/中 吸引力组合生成「🔥 策略共振」卡片，只推送共振股票。
-- **每日 Markdown 报告**：自动生成 `Sequoia-X_选股报告_YYYY-MM-DD.md`，默认输出到 `~/Documents/量化交易/今日选股结果`（可用 `REPORT_OUTPUT_DIR` 修改），含概览、各策略明细与共振板块。
-- **推送容错**：飞书连接类异常自动重试（最多 3 次，指数退避），失败不影响其他策略。
-
----
-
-## 快速开始 | Quick Start
-
-### 环境要求
-
-- Python >= 3.10
-
-### 1. 安装依赖
-
-```bash
-# 推荐使用 uv（快速包管理器）
-uv sync
-
-# 或者 pip
-pip install .
-```
-
-### 2. 配置环境变量
-
-```bash
-cp .env.example .env
-# 编辑 .env，必填 FEISHU_WEBHOOK_URL（兜底飞书机器人）
-```
-
-可选配置：每个策略独立的飞书机器人，以及报告输出目录：
+Python >= 3.10，使用 `uv sync --extra dev` 或 `pip install -e ".[dev]"` 安装依赖。
+首次安装可复制 `.env.example` 为 `.env`；已有配置无需覆盖。
 
 ```env
-FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx   # 必填
-STRATEGY_WEBHOOK_MA_VOLUME=https://open.feishu.cn/open-apis/bot/v2/hook/xxx   # 可选
-REPORT_OUTPUT_DIR=/path/to/reports   # 可选
+DATA_SOURCE=tdx
+TDX_BASE_URL=http://192.168.1.74:8080
+TDX_DB_PATH=data/sequoia_tdx.db
+TDX_TIMEOUT_SECONDS=30
+START_DATE=2024-01-01
+REPORT_OUTPUT_DIR=reports
 ```
 
-为降低 baostock 限流风险，默认启用 2 进程（1~4 可调）并在每个进程的请求之间加入随机等待：
-
-```env
-BAOSTOCK_MAX_WORKERS=2
-BAOSTOCK_REQUEST_DELAY_SECONDS=0.8
-BAOSTOCK_REQUEST_JITTER_SECONDS=0.8
-BAOSTOCK_ERROR_COOLDOWN_SECONDS=30
-```
-
-### 3. 首次回填历史数据
-
-```bash
-python main.py --backfill
-```
-
-启用请求保护后，~5200 只 A 股历史后复权日 K 数据回填可能需要 1 小时以上，
-具体耗时取决于 `.env` 中的 baostock 限速参数。回填支持断点续传，中断后重新运行即可接着灌。
-
-### 4. 日常运行
-
-```bash
-python main.py
-```
-
-建议配合 crontab 每个交易日收盘后自动执行：
-
-```cron
-15 19 * * 1-5 cd "$HOME/Sequoia-X" && .venv/bin/python main.py >> log.txt 2>&1
-```
-
----
+运行 `uv run python main.py`。默认报告路径：`reports/Sequoia-X_选股报告_YYYY-MM-DD.md`；
+已有 `REPORT_OUTPUT_DIR` 配置优先。报告包含行情日期、股票池规模和实际扫描数量。
+TDX 同步失败或最后行情日期落后的股票不会进入当次扫描，全部同步失败则终止。
+定增策略仍通过 akshare 获取事件数据，但结果同样受股票池约束。
+可设置 `DATA_SOURCE=baostock` 使用旧数据源，其数据库由独立的 `DB_PATH` 控制。
 
 ## 目录结构 | Project Structure
 
@@ -215,6 +148,9 @@ Sequoia-X/
 │   │   ├── config.py              # Pydantic-settings 配置管理
 │   │   └── logger.py              # rich 结构化日志
 │   ├── data/
+│   │   ├── tdx.py                 # TDX HTTP adapter
+│   │   ├── factory.py             # Provider selection
+│   │   ├── universe.py            # Shared stock filters
 │   │   └── engine.py              # 数据引擎（baostock 回填 + 增量同步 + SQLite）
 │   ├── strategy/
 │   │   ├── base.py                # 策略抽象基类
@@ -241,13 +177,11 @@ Sequoia-X/
 
 ## 数据说明
 
-- **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）；仅定增公告策略使用 akshare。
-- **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱。
-- **存储**：本地 SQLite（`data/sequoia_v2.db`，WAL 模式），可直接拷贝到其他机器使用。
-- **日常增量**：多进程并行（默认 2 进程，`BAOSTOCK_MAX_WORKERS` 可调，上限 4）+ 请求随机抖动，降低被限流风险；写入采用先删后插，避免中断造成脏数据。
-- **回填**：单线程保守拉取 + 断点续传 + 每 200 只主动重连 + 单票失败重试 3 次（指数退避）。
-
----
+- 股票与名称：`/code/all?exchange=sh|sz`；日线：`/kline/day`，每页最多800根；海龟市值排序通过 `/finance` 获取流通股本。
+- Go 的 Price 字段（开高低收及成交额）除以1000转为元；成交量乘100，从手转为股。
+- TDX 接口日线为**不复权**，除权除息可能影响均线、突破和涨跌幅信号。当前适配不等同于原 baostock 后复权数据。
+- 使用独立的 `data/sequoia_tdx.db`，不要将两个数据源指向同一数据库。
+- 增量更新重叠覆盖最后交易日、按日期去重；上海时间15点前不使用当日未完成日线。
 
 ## 测试 | Tests
 
@@ -262,3 +196,38 @@ uv run pytest
 ## 许可证 | License
 
 MIT
+
+## 周线方向与日线候选
+
+默认启用 `WEEKLY_FILTER_ENABLED=true`。日线合成周线，方向条件为：周收盘 > 周MA10 > 周MA20，且周MA20较上一周上升。至少需要21根已完成周线；不足则不进入候选。
+
+以数据最后交易日作为计算时点，仅纳入周五标签不晚于该日期的周线。周中不使用本周数据；没有交易日历时，节假日提前结束的周会保守延后确认，首个不足周也不计入。
+
+日线策略先按原完整合规股票池计算和排名，再过滤周线方向；串行和并行共用这一处理。共振仅统计过滤后结果，报告另列被过滤候选及周线日期。整理、公告、止跌类依然是观察信号，不自动变为确认买点。
+
+可在 `.env` 配置实际持仓，例如 `HOLDING_SYMBOLS=["600000","000001"]`。无论持仓是否在当日候选中，均检查：连续两日收盘低于日MA20，或收盘跌破此前10日最低价；任一成立即显示退出提示。无有效行情时明确标记无法评估，不视为继续持有。
+
+未配置持仓时不生成卖点判断。当前不包含成本止损、买入日期、交易可成交性及自动下单；信号收盘后确认，供下一交易日决策。TDX 不复权限制仍适用，规则参数尚未经收益回测验证。关闭周线功能会恢复原日线报告，也不输出本模块的持仓退出提示。
+
+## 跳过数据拉取
+
+```powershell
+.\.venv\Scripts\python.exe main.py --skip-sync
+.\.venv\Scripts\python.exe main.py --skip-sync --parallel --max-workers 2
+```
+
+读取 TDX 本地数据库及缓存股票池，不同步行情，也不查询定增公告或实时流通市值。原有周线过滤和本地报告仍运行；报告标明快照模式与行情日期。无可用本地行情时明确报错，不能与 `--backfill` 同用。缓存中的 ST 状态可能已过时，需定期正常同步。baostock 未缓存股票状态，暂不支持该离线模式。
+
+## 定增接口异常保护
+
+定增公告通过独立子进程获取，45秒超时后终止。Windows OpenSSL 等原生库即使异常退出，也不会终止主进程或破坏策略进程池。报告列出未完成策略，不能将接口失败解读为“没有定增股票”。这一措施隔离异常，不修复第三方库的 OpenSSL 二进制兼容问题。`--skip-sync` 模式完全跳过该外部接口。
+
+## 报告风险分层与指标口径
+
+报告按“风险优先核查、20日突破已发生、回调或止跌观察、整理等待确认、强势或转强观察”展示候选，不改变原策略入选或周线过滤。风险提示优先于形态分类，同组按代码排列，不作为推荐排序。
+
+默认标记当日跌幅达到8%，或收盘高于日MA20达到20%的候选。可用 `REPORT_SHARP_DROP_PCT`、`REPORT_OVERHEAT_PCT` 调整；这些展示阈值未经收益校准，不是涨跌停定义，也不自动触发交易。
+
+报告补充收盘价、日涨跌幅、日/周MA20偏离、前20日均量口径量比、成交额、RPS120、距20/120日前高、日MA20及前10日低点。历史不足显示“—”。三倍量候选另列最近历史信号日期及信号次日至昨日的平台高点，避免把历史放量解释为当日突破。
+
+多策略共同入选改为列出所有实际重叠，不再显示“高/中吸引力”；120日突破与20日突破的条件重叠会注明。报告列出同步未完成或行情落后的股票，但缓存没有名单更新时间时只能明确标为未知；公司公告、除权事件仍未独立核验。

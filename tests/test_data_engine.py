@@ -1,5 +1,6 @@
 """数据引擎属性测试。"""
 
+from contextlib import closing
 import sqlite3
 import tempfile
 from datetime import date
@@ -40,7 +41,7 @@ def _seed_test_data(engine: DataEngine, symbols: list[str], dates: list[str]) ->
                 "volume": 1000.0 + i * 100,
                 "turnover": 10500.0 + i * 1000,
             })
-    with sqlite3.connect(engine.db_path) as conn:
+    with closing(sqlite3.connect(engine.db_path)) as conn, conn:
         pd.DataFrame(rows).to_sql(
             "stock_daily", conn, if_exists="append",
             index=False, method="multi",
@@ -64,7 +65,7 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
             "volume": 1000.0, "turnover": 10500.0,
         }
         df = pd.DataFrame([row])
-        with sqlite3.connect(engine.db_path) as conn:
+        with closing(sqlite3.connect(engine.db_path)) as conn, conn:
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
             try:
                 df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
@@ -138,6 +139,6 @@ def test_wal_mode_enabled() -> None:
     """数据库应启用 WAL 日志模式。"""
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
-        with sqlite3.connect(engine.db_path) as conn:
+        with closing(sqlite3.connect(engine.db_path)) as conn, conn:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode.upper() == "WAL"

@@ -1,18 +1,29 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from typing import Literal
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
     start_date: str = "2024-01-01"
-    feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
+    report_overheat_pct: float = Field(default=20.0, gt=0)
+    report_sharp_drop_pct: float = Field(default=8.0, gt=0)
+    weekly_filter_enabled: bool = True
+    holding_symbols: list[str] = Field(default_factory=list)
+    data_source: Literal["tdx", "baostock"] = "tdx"
+    tdx_base_url: str = "http://192.168.1.74:8080"
+    tdx_db_path: str = "data/sequoia_tdx.db"
+    tdx_timeout_seconds: float = Field(default=30.0, gt=0)
+    feishu_webhook_url: str = ""  # 兼容旧配置，日常流程不发送通知
     strategy_webhooks: dict[str, str] = {}
     baostock_max_workers: int = 2
     baostock_request_delay_seconds: float = 0.8
     baostock_request_jitter_seconds: float = 0.8
     baostock_error_cooldown_seconds: float = 30.0
-    report_output_dir: str = ""  # 空字符串表示使用默认路径（Documents/量化交易/今日选股结果）
+    report_output_dir: str = "reports"  # 空字符串也使用项目 reports 目录
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -81,7 +92,7 @@ def get_settings() -> Settings:
     """返回全局 Settings 单例。
 
     首次调用时从环境变量或 .env 文件加载配置。
-    若必填字段（feishu_webhook_url）缺失，抛出 pydantic_core.ValidationError。
+    飞书配置为可选，日常流程只生成本地报告。
 
     Returns:
         Settings: 全局唯一的配置实例。

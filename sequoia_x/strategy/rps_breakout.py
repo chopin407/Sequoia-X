@@ -1,5 +1,3 @@
-import sqlite3
-
 import pandas as pd
 
 from sequoia_x.core.logger import get_logger
@@ -17,8 +15,7 @@ class RpsBreakoutStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         try:
-            with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
+            df = self.engine.strategy_frame()
         except Exception as exc:
             logger.error(f"读取数据库失败: {exc}")
             return []

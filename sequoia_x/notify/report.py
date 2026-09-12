@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.notify.diagnostics import diagnostic_markdown
 
 logger = get_logger(__name__)
 
@@ -19,8 +20,9 @@ class ReportGenerator:
         settings: Settings 实例，获取输出目录配置。
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, engine=None) -> None:
         self.settings = settings
+        self.engine = engine
         self._stock_name_cache: dict[str, str] = {}
 
     # ── 输出目录 ──
@@ -31,7 +33,7 @@ class ReportGenerator:
         if configured:
             output_dir = Path(configured).expanduser().resolve()
         else:
-            output_dir = Path.home() / "Documents" / "量化交易" / "今日选股结果"
+            output_dir = Path("reports").resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir
 
@@ -99,6 +101,9 @@ class ReportGenerator:
         用腾讯行情接口兜底；北交所股票（4/8/92 开头）直接走腾讯行情接口
         （baostock 无北交所数据）。单只失败不影响其他。
         """
+        if self.engine is not None:
+            return {s: self.engine.get_stock_name(s) or s for s in symbols}
+
         unique_symbols = list(dict.fromkeys(symbols))
         missing = [
             s for s in unique_symbols if s not in self._stock_name_cache
@@ -181,6 +186,14 @@ class ReportGenerator:
         lines.append(f"# 📈 Sequoia-X 选股报告 — {today}")
         lines.append("")
 
+        if self.engine is not None:
+            if getattr(self.engine, "local_only", False):
+                lines.append("> 本地快照：未更新行情及股票状态；已跳过公告接口与实时市值排序。")
+            lines.append(self.engine.report_status())
+            if hasattr(self.engine, "report_exclusions"):
+                lines.append(self.engine.report_exclusions())
+            lines.append("")
+
         # ── 概览 ──
         total_strategies = len(strategy_results)
         active_strategies = sum(
@@ -190,12 +203,11 @@ class ReportGenerator:
         for symbols in strategy_results.values():
             all_symbols.update(symbols)
 
-        # 共振的去重股票数
-        resonance_symbols: set[str] = set()
-        for groups in resonance_hits.values():
-            for group in groups:
-                for s in group["symbols"]:
-                    resonance_symbols.add(str(s))
+        counts = {}
+        for symbols in strategy_results.values():
+            for symbol in set(symbols):
+                counts[symbol] = counts.get(symbol, 0) + 1
+        resonance_symbols = {s for s, count in counts.items() if count > 1}
 
         lines.append("## 概览")
         lines.append("")
@@ -206,7 +218,7 @@ class ReportGenerator:
         )
         if resonance_symbols:
             lines.append(
-                f"- **策略共振股票数（去重）**：{len(resonance_symbols)}"
+                f"- **多策略共同入选数（去重）**：{len(resonance_symbols)}"
             )
         lines.append("")
 
@@ -219,10 +231,16 @@ class ReportGenerator:
         all_codes = sorted(all_symbols | resonance_symbols)
         names = self._get_stock_names(all_codes)
 
+        if self.engine is not None:
+            lines.append(diagnostic_markdown(self.engine, strategy_results, self.settings))
+
         # ── 各策略详情 ──
         lines.append("---")
         lines.append("")
         lines.append("## 各策略选股详情")
+        lines.append("")
+
+        lines.append("列表顺序沿用策略输出，不是统一推荐顺序；本地模式海龟列表未经实时流通市值排序。")
         lines.append("")
 
         # 按策略名排序，有结果优先
@@ -255,51 +273,6 @@ class ReportGenerator:
                 )
             lines.append("")
 
-        # ── 策略共振 ──
-        if resonance_hits.get("high") or resonance_hits.get("medium"):
-            lines.append("---")
-            lines.append("")
-            lines.append("## 🔥 策略共振")
-            lines.append("")
-
-            def _section(
-                label: str,
-                emoji: str,
-                groups: list[dict[str, object]],
-            ) -> None:
-                if not groups:
-                    return
-                lines.append(f"### {emoji} {label}")
-                lines.append("")
-                for group in groups:
-                    combo_label = str(group["combo_label"])
-                    count = group["count"]
-                    lines.append(
-                        f"#### {combo_label}（{count}只）"
-                    )
-                    lines.append("")
-                    lines.append(
-                        "| # | 代码 | 名称 | 雪球链接 |"
-                    )
-                    lines.append(
-                        "|---|------|------|----------|"
-                    )
-                    for i, code in enumerate(group["symbols"], 1):
-                        code_str = str(code)
-                        name = names.get(code_str, code_str)
-                        xq_code = self._to_xueqiu_code(code_str)
-                        link = (
-                            f"https://xueqiu.com/S/{xq_code}"
-                        )
-                        lines.append(
-                            f"| {i} | {code_str} | {name} "
-                            f"| [{name}]({link}) |"
-                        )
-                    lines.append("")
-
-            _section("高吸引力共振", "🔴", resonance_hits.get("high", []))
-            _section("中吸引力共振", "🟡", resonance_hits.get("medium", []))
-
         # ── 页脚 ──
         lines.append("---")
         lines.append("")
@@ -316,6 +289,7 @@ class ReportGenerator:
         self,
         strategy_results: dict[str, list[str]],
         resonance_hits: dict[str, list[dict[str, object]]],
+        extra_section: str = "",
     ) -> Path:
         """生成 Markdown 报告并写入磁盘。
 
@@ -331,6 +305,8 @@ class ReportGenerator:
             OSError: 文件写入失败时抛出（调用方应捕获）。
         """
         md_content = self._build_markdown(strategy_results, resonance_hits)
+        if extra_section:
+            md_content += "\n\n" + extra_section
         output_dir = self._resolve_output_dir()
         today = date.today().strftime("%Y-%m-%d")
         filename = f"Sequoia-X_选股报告_{today}.md"

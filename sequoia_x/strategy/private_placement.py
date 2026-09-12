@@ -1,6 +1,10 @@
 """定增公告监控策略：推送最近发布的定向增发公告。"""
 
+import subprocess
+import sys
+import tempfile
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -23,15 +27,34 @@ class PrivatePlacementStrategy(BaseStrategy):
     webhook_key: str = "private_placement"
     _LOOKBACK_DAYS: int = 7  # 回看天数，覆盖一周内的新公告
 
-    def run(self) -> list[str]:
-        """拉取定增公告，返回近期有定向增发的股票代码列表。"""
-        try:
-            import akshare as ak
+    def _fetch_data(self) -> pd.DataFrame:
+        """隔离第三方原生库；进程崩溃或超时转换为可捕获异常。"""
+        script = (
+            "import sys; import akshare as ak; "
+            "ak.stock_qbzf_em().to_json(sys.argv[1], orient='split', force_ascii=False)"
+        )
+        with tempfile.TemporaryDirectory(prefix="sequoia_placement_") as directory:
+            output = Path(directory) / "data.json"
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-X", "utf8", "-c", script, str(output)],
+                    capture_output=True, timeout=45, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("定增数据获取超过45秒，已终止子进程") from exc
+            if result.returncode != 0:
+                # 不输出第三方完整日志，以免其中携带代理或认证配置。
+                applink = b"OPENSSL_Applink" in result.stderr
+                reason = "OPENSSL_Applink 原生库错误" if applink else "第三方数据接口异常"
+                raise RuntimeError(f"定增数据获取失败：{reason}（退出码 {result.returncode}）")
+            if not output.is_file():
+                raise RuntimeError("定增数据子进程未返回结果")
+            return pd.read_json(output, orient="split", dtype=False)
 
-            df = ak.stock_qbzf_em()
-        except Exception as exc:
-            logger.error(f"PrivatePlacementStrategy 获取定增数据失败：{exc}")
-            return []
+    def run(self) -> list[str]:
+        """拉取定增公告；失败交由主流程记录，继续生成其他策略报告。"""
+        df = self._fetch_data()
 
         if df is None or df.empty:
             logger.info("PrivatePlacementStrategy 无定增数据")

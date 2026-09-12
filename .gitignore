@@ -44,3 +44,6 @@ build/
 
 # 本地回测数据（不上传）
 回测数据
+
+reports/
+data/*.db-*

@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-import sqlite3
-
 import numpy as np
 import pandas as pd
 
@@ -181,44 +179,7 @@ class StopFallStrategy(BaseStrategy):
 
     def _load_daily_data(self) -> tuple[pd.DataFrame, str | None]:
         """按实际表结构读取字段，成交活跃度字段缺失时降级为价格模型。"""
-        with sqlite3.connect(self.engine.db_path) as conn:
-            schema_rows = conn.execute("PRAGMA table_info(stock_daily)").fetchall()
-            available_columns = {str(row[1]) for row in schema_rows}
-
-            required_columns = {"symbol", "date", "high", "low", "close"}
-            missing_columns = required_columns - available_columns
-            if missing_columns:
-                missing_text = ", ".join(sorted(missing_columns))
-                raise ValueError(f"stock_daily 缺少必要字段: {missing_text}")
-
-            liquidity_col = next(
-                (
-                    col
-                    for col in self.liquidity_column_candidates
-                    if col in available_columns
-                ),
-                None,
-            )
-
-            selected_columns = ["symbol", "date", "high", "low", "close"]
-            if liquidity_col is not None:
-                selected_columns.append(liquidity_col)
-
-            # 名称和 ST 标记仅在表中存在时读取，不强依赖具体股票基础表。
-            for optional_col in ("name", "is_st"):
-                if optional_col in available_columns:
-                    selected_columns.append(optional_col)
-
-            sql = f"SELECT {', '.join(selected_columns)} FROM stock_daily"
-            df = pd.read_sql(sql, conn)
-
-        if liquidity_col is None:
-            logger.warning(
-                "stock_daily 未找到换手率/成交额/成交量字段，"
-                "将跳过抛压衰竭因子并自动重分配权重"
-            )
-
-        return df, liquidity_col
+        return self.engine.strategy_frame(), "turnover"
 
     def _build_features(
         self, df: pd.DataFrame, liquidity_col: str | None

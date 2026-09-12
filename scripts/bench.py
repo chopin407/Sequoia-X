@@ -14,7 +14,7 @@ load_dotenv()
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.engine import DataEngine
+from sequoia_x.data.factory import create_engine
 from sequoia_x.strategy.bowl_rebound import BowlReboundStrategy
 from sequoia_x.strategy.FirstNewHigh30DaysBreakoutStrategy import FirstNewHigh30DaysBreakoutStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -50,7 +50,7 @@ STRATEGIES = [
 
 def main():
     settings = get_settings()
-    engine = DataEngine(settings)
+    engine = create_engine(settings)
     logger.info(f"DB: {settings.db_path}, symbols: {len(engine.get_local_symbols())}")
 
     timings = {}
